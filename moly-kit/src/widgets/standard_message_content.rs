@@ -1,6 +1,7 @@
 use crate::{
     aitk::{protocol::*, utils::tool::display_name_from_namespaced},
     widgets::{
+        a2ui_client::is_a2ui_tool_call,
         attachment_list::AttachmentListWidgetExt,
         attachment_viewer_modal::AttachmentViewerModalWidgetExt,
     },
@@ -104,8 +105,22 @@ impl StandardMessageContent {
             let text_with_typing = format!("{} {}", content.text, TYPING_INDICATOR);
             markdown.set_text(cx, &convert_math_delimiters(&text_with_typing));
         } else if !content.tool_calls.is_empty() {
-            let tool_calls_text = Self::generate_tool_calls_text(content);
-            markdown.set_text(cx, &convert_math_delimiters(&tool_calls_text));
+            // Filter out A2UI tool calls from display
+            let non_a2ui: Vec<_> = content.tool_calls.iter()
+                .filter(|tc| !is_a2ui_tool_call(&tc.name))
+                .collect();
+            if non_a2ui.is_empty() {
+                // Only A2UI tool calls - show text or placeholder
+                let display_text = if content.text.trim().is_empty() {
+                    "*UI updated in canvas*".to_string()
+                } else {
+                    content.text.clone()
+                };
+                markdown.set_text(cx, &convert_math_delimiters(&display_text));
+            } else {
+                let tool_calls_text = Self::generate_tool_calls_text(content);
+                markdown.set_text(cx, &convert_math_delimiters(&tool_calls_text));
+            }
         } else {
             markdown.set_text(cx, &convert_math_delimiters(&content.text));
         }

@@ -7,6 +7,7 @@ use crate::{
     aitk::{controllers::chat::ChatController, protocol::*},
     utils::makepad::{events::EventExt, portal_list::ItemsRangeIter, ui_runner::DeferRedraw},
     widgets::{
+        a2ui_client::is_a2ui_tool_call,
         avatar::AvatarWidgetRefExt, chat_line::ChatLineAction,
         message_loading::MessageLoadingWidgetRefExt,
     },
@@ -220,6 +221,11 @@ impl Messages {
         // the list draw.
         let mut chat_controller = chat_controller.lock().unwrap();
 
+        let msg_count = chat_controller.state().messages.len();
+        if msg_count == 0 {
+            ::log::info!("Messages::draw_list called with 0 messages");
+        }
+
         let last_message_index = chat_controller.state().messages.len().checked_sub(1);
         let second_last_message_index = last_message_index.and_then(|i| i.checked_sub(1));
 
@@ -303,30 +309,41 @@ impl Messages {
                     item
                 }
                 EntityId::Tool => {
-                    // Render tool execution results
-                    let item = if message.metadata.is_writing() {
-                        // Show loading animation for tool execution
-                        let item = list.item(cx, index, live_id!(LoadingLine));
-                        item.message_loading(ids!(content_section.loading))
-                            .animate(cx);
+                    // Skip rendering synthetic A2UI tool results
+                    let is_a2ui_result = message.content.text.is_empty()
+                        && !message.content.tool_results.is_empty()
+                        && message.content.tool_results.iter().all(|r| {
+                            r.content.contains("rendered successfully")
+                        });
+
+                    if is_a2ui_result {
+                        // Use a zero-height empty item
+                        let item = list.item(cx, index, live_id!(Empty));
                         item
                     } else {
-                        list.item(cx, index, live_id!(ToolResultLine))
-                    };
+                        let item = if message.metadata.is_writing() {
+                            let item = list.item(cx, index, live_id!(LoadingLine));
+                            item.message_loading(ids!(content_section.loading))
+                                .animate(cx);
+                            item
+                        } else {
+                            list.item(cx, index, live_id!(ToolResultLine))
+                        };
 
-                    item.avatar(ids!(avatar)).borrow_mut().unwrap().avatar =
-                        Some(EntityAvatar::Text("T".into()));
-                    item.label(ids!(name)).set_text(cx, "Tool");
+                        item.avatar(ids!(avatar)).borrow_mut().unwrap().avatar =
+                            Some(EntityAvatar::Text("T".into()));
+                        item.label(ids!(name)).set_text(cx, "Tool");
 
-                    if !message.metadata.is_writing() {
-                        item.slot(ids!(content))
-                            .current()
-                            .as_standard_message_content()
-                            .set_content(cx, &message.content);
+                        if !message.metadata.is_writing() {
+                            item.slot(ids!(content))
+                                .current()
+                                .as_standard_message_content()
+                                .set_content(cx, &message.content);
+                        }
+
+                        self.apply_editor_visibility(cx, &item, index);
+                        item
                     }
-
-                    self.apply_editor_visibility(cx, &item, index);
-                    item
                 }
                 EntityId::App => {
                     if message.content.text == "EOC" {
@@ -445,29 +462,35 @@ impl Messages {
                                 .animate(cx);
                             item
                         } else if !message.content.tool_calls.is_empty() {
-                            let item = list.item(cx, index, live_id!(ToolRequestLine));
+                            // Check if all tool calls are A2UI (rendered in canvas)
+                            let has_non_a2ui = message.content.tool_calls.iter()
+                                .any(|tc| !is_a2ui_tool_call(&tc.name));
 
-                            // Set visibility and status based on permission status
-                            let has_pending = message.content.tool_calls.iter().any(|tc| {
-                                tc.permission_status == ToolCallPermissionStatus::Pending
-                            });
-                            let has_denied =
-                                message.content.tool_calls.iter().any(|tc| {
-                                    tc.permission_status == ToolCallPermissionStatus::Denied
+                            if has_non_a2ui {
+                                let item = list.item(cx, index, live_id!(ToolRequestLine));
+
+                                let has_pending = message.content.tool_calls.iter().any(|tc| {
+                                    tc.permission_status == ToolCallPermissionStatus::Pending
                                 });
+                                let has_denied =
+                                    message.content.tool_calls.iter().any(|tc| {
+                                        tc.permission_status == ToolCallPermissionStatus::Denied
+                                    });
 
-                            // Show/hide tool actions based on status
-                            item.view(ids!(tool_actions)).set_visible(cx, has_pending);
+                                item.view(ids!(tool_actions)).set_visible(cx, has_pending);
 
-                            // Set status text, only show if denied
-                            if has_denied {
-                                item.view(ids!(status_view)).set_visible(cx, true);
-                                item.label(ids!(approved_status)).set_text(cx, "Denied");
+                                if has_denied {
+                                    item.view(ids!(status_view)).set_visible(cx, true);
+                                    item.label(ids!(approved_status)).set_text(cx, "Denied");
+                                } else {
+                                    item.view(ids!(status_view)).set_visible(cx, false);
+                                }
+
+                                item
                             } else {
-                                item.view(ids!(status_view)).set_visible(cx, false);
+                                // All tool calls are A2UI - render as normal bot line
+                                list.item(cx, index, live_id!(BotLine))
                             }
-
-                            item
                         } else {
                             list.item(cx, index, live_id!(BotLine))
                         };
@@ -546,23 +569,18 @@ impl Messages {
             .as_ref()
             .expect("no chat controller set");
 
-        if chat_controller.lock().unwrap().state().messages.len() > 0 {
-            let list = self.portal_list(ids!(list));
+        let message_count = chat_controller.lock().unwrap().state().messages.len();
+        let list = self.portal_list(ids!(list));
 
+        if message_count > 0 {
             // Use immediate scroll instead of smooth scroll to prevent continuous scroll actions
-            list.set_first_id_and_scroll(
-                chat_controller
-                    .lock()
-                    .unwrap()
-                    .state()
-                    .messages
-                    .len()
-                    .saturating_sub(1),
-                0.0,
-            );
-
-            self.redraw(cx);
+            list.set_first_id_and_scroll(message_count.saturating_sub(1), 0.0);
+        } else {
+            // Reset to beginning when no messages
+            list.set_first_id_and_scroll(0, 0.0);
         }
+
+        self.redraw(cx);
     }
 
     /// Smoothly scroll to the end of the list.

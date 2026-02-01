@@ -2,13 +2,25 @@ use makepad_widgets::*;
 use std::cell::{Ref, RefMut};
 use std::sync::{Arc, Mutex};
 
+use crate::aitk::protocol::ToolCall;
 use crate::aitk::utils::tool::display_name_from_namespaced;
 use crate::prelude::*;
 use crate::utils::makepad::events::EventExt;
+use crate::widgets::a2ui_client::{is_a2ui_tool_call, set_pending_a2ui_tool_calls};
 use crate::widgets::stt_input::*;
 
 // Re-export type needed to configure STT.
 pub use crate::widgets::stt_input::SttUtility;
+
+/// Actions emitted by the Chat widget
+#[derive(Clone, Debug, DefaultNone)]
+pub enum ChatAction {
+    None,
+    /// A2UI tool calls were received from the model
+    A2uiToolCalls(Vec<ToolCall>),
+    /// A2UI toggle was changed
+    A2uiToggled(bool),
+}
 
 live_design!(
     use link::theme::*;
@@ -72,7 +84,7 @@ impl Widget for Chat {
         self.deref.handle_event(cx, event, scope);
 
         self.handle_messages(cx, event);
-        self.handle_prompt_input(cx, event);
+        self.handle_prompt_input(cx, event, scope);
         self.handle_stt_input_actions(cx, event);
         self.handle_realtime(cx);
         self.handle_modal_dismissal(cx, event);
@@ -111,7 +123,7 @@ impl Chat {
         self.stt_input_ref().read().stt_utility().cloned()
     }
 
-    fn handle_prompt_input(&mut self, cx: &mut Cx, event: &Event) {
+    fn handle_prompt_input(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let submitted = self.prompt_input_ref().read().submitted(event.actions());
         if submitted {
             self.handle_submit(cx);
@@ -128,6 +140,16 @@ impl Chat {
             self.stt_input_ref().set_visible(cx, true);
             self.stt_input_ref().write().start_recording(cx);
             self.redraw(cx);
+        }
+
+        // Forward A2UI toggle action to parent
+        if let Some(a2ui_enabled) = self.prompt_input_ref().a2ui_toggled(event.actions()) {
+            eprintln!("[Chat] Forwarding A2UI toggle: {}", a2ui_enabled);
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                ChatAction::A2uiToggled(a2ui_enabled),
+            );
         }
     }
 
@@ -476,6 +498,105 @@ impl Chat {
             .is_streaming
     }
 
+    /// Check for A2UI tool calls in messages and emit an action if found
+    /// Also auto-approves A2UI tool calls so they don't need user permission
+    fn emit_a2ui_tool_calls(&self, cx: &mut Cx, scope: &mut Scope) {
+        use crate::aitk::protocol::ToolCallPermissionStatus;
+
+        let Some(controller) = &self.chat_controller else {
+            return;
+        };
+
+        // First, find and collect A2UI tool calls from the same message
+        let (a2ui_tool_calls, message_index) = {
+            let lock = controller.lock().unwrap();
+            let messages = &lock.state().messages;
+
+            // Find the last bot message with A2UI tool calls
+            let result = messages
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, m)| {
+                    matches!(m.from, EntityId::Bot(_))
+                        && m.content
+                            .tool_calls
+                            .iter()
+                            .any(|tc| is_a2ui_tool_call(&tc.name))
+                })
+                .map(|(idx, m)| {
+                    let tool_calls: Vec<ToolCall> = m
+                        .content
+                        .tool_calls
+                        .iter()
+                        .filter(|tc| is_a2ui_tool_call(&tc.name))
+                        .cloned()
+                        .collect();
+                    (tool_calls, idx)
+                });
+
+            match result {
+                Some((tool_calls, idx)) => (tool_calls, Some(idx)),
+                None => (Vec::new(), None),
+            }
+        };
+
+        if !a2ui_tool_calls.is_empty() {
+            // Auto-approve A2UI tool calls so they don't show the
+            // permission prompt
+            if let Some(idx) = message_index {
+                let mut lock = controller.lock().unwrap();
+                let mut message = lock.state().messages[idx].clone();
+
+                for tool_call in &mut message.content.tool_calls {
+                    if is_a2ui_tool_call(&tool_call.name) {
+                        tool_call.permission_status =
+                            ToolCallPermissionStatus::Approved;
+                    }
+                }
+
+                lock.dispatch_mutation(VecMutation::Update(idx, message));
+
+                // Add synthetic tool results so the conversation history
+                // remains valid for subsequent API calls. The OpenAI API
+                // requires a tool result message for every tool_call.
+                let tool_results: Vec<ToolResult> = a2ui_tool_calls
+                    .iter()
+                    .map(|tc| ToolResult {
+                        tool_call_id: tc.id.clone(),
+                        content: format!(
+                            "UI component '{}' rendered successfully.",
+                            tc.name
+                        ),
+                        is_error: false,
+                    })
+                    .collect();
+
+                lock.dispatch_mutation(VecMutation::Push(Message {
+                    from: EntityId::Tool,
+                    content: MessageContent {
+                        text: String::new(),
+                        tool_results,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }));
+            }
+
+            // Store tool calls in global state for the shell app
+            set_pending_a2ui_tool_calls(a2ui_tool_calls.clone());
+
+            // Also emit as widget action (for local consumers)
+            cx.widget_action(
+                self.widget_uid(),
+                &scope.path,
+                ChatAction::A2uiToolCalls(a2ui_tool_calls),
+            );
+
+            cx.redraw_all();
+        }
+    }
+
     pub fn set_chat_controller(
         &mut self,
         _cx: &mut Cx,
@@ -562,6 +683,16 @@ impl ChatRef {
     pub fn write_with<R>(&mut self, f: impl FnOnce(&mut Chat) -> R) -> R {
         f(&mut *self.write())
     }
+
+    /// Check if A2UI tool calls were received and return them
+    pub fn a2ui_tool_calls(&self, actions: &Actions) -> Option<Vec<ToolCall>> {
+        if let Some(item) = actions.find_widget_action(self.widget_uid()) {
+            if let ChatAction::A2uiToolCalls(tool_calls) = item.cast() {
+                return Some(tool_calls);
+            }
+        }
+        None
+    }
 }
 
 impl Drop for Chat {
@@ -590,8 +721,10 @@ impl ChatControllerPlugin for Plugin {
                     });
                 }
                 ChatStateMutation::SetIsStreaming(false) => {
-                    self.ui.defer(|chat, cx, _| {
+                    self.ui.defer(|chat, cx, scope| {
                         chat.handle_streaming_end(cx);
+                        // Check for A2UI tool calls in the last message and emit action
+                        chat.emit_a2ui_tool_calls(cx, scope);
                     });
                 }
                 ChatStateMutation::MutateBots(_) => {
