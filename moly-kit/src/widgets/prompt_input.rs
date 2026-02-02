@@ -131,8 +131,10 @@ live_design! {
     pub PromptInput = {{PromptInput}} <CommandTextInput> {
         send_icon: dep("crate://self/resources/send.svg"),
         stop_icon: dep("crate://self/resources/stop.svg"),
+        width: Fill
         height: Fit { max: 350 }
         persistent = {
+            width: Fill
             height: Fit
             padding: {top: 10, bottom: 10, left: 10, right: 10}
             draw_bg: {
