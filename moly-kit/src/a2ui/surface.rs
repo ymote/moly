@@ -198,8 +198,8 @@ live_design! {
         // Text rendering settings (for text outside cards)
         draw_text: {
             text_style: <THEME_FONT_REGULAR> {
-                font_size: 14.0
-                line_spacing: 1.4
+                font_size: 11.0
+                line_spacing: 1.3
             }
             color: #FFFFFF
         }
@@ -207,8 +207,8 @@ live_design! {
         // Text rendering for content inside cards (separate draw item)
         draw_card_text: {
             text_style: <THEME_FONT_REGULAR> {
-                font_size: 14.0
-                line_spacing: 1.4
+                font_size: 11.0
+                line_spacing: 1.3
             }
             color: #FFFFFF
         }
@@ -250,8 +250,8 @@ live_design! {
         // Text rendering for button labels (drawn after button background)
         draw_button_text: {
             text_style: <THEME_FONT_BOLD> {
-                font_size: 14.0
-                line_spacing: 1.4
+                font_size: 11.0
+                line_spacing: 1.3
             }
             color: #FFFFFF
         }
@@ -299,7 +299,7 @@ live_design! {
         // TextField input text
         draw_text_field_text: {
             text_style: <THEME_FONT_REGULAR> {
-                font_size: 14.0
+                font_size: 11.0
             }
             color: #FFFFFF
         }
@@ -307,7 +307,7 @@ live_design! {
         // TextField placeholder text
         draw_text_field_placeholder: {
             text_style: <THEME_FONT_REGULAR> {
-                font_size: 14.0
+                font_size: 11.0
             }
             color: #888888
         }
@@ -322,7 +322,7 @@ live_design! {
         // Checkbox label text
         draw_checkbox_label: {
             text_style: <THEME_FONT_REGULAR> {
-                font_size: 14.0
+                font_size: 11.0
             }
             color: #FFFFFF
         }
@@ -353,8 +353,8 @@ live_design! {
 
         draw_text: {
             text_style: <THEME_FONT_REGULAR> {
-                font_size: 14.0
-                line_spacing: 1.4
+                font_size: 11.0
+                line_spacing: 1.3
             }
             color: (FOREGROUND)
         }
@@ -438,7 +438,7 @@ live_design! {
         }
 
         draw_text: {
-            text_style: <THEME_FONT_BOLD> { font_size: 14.0 }
+            text_style: <THEME_FONT_BOLD> { font_size: 11.0 }
             color: #FFFFFF
         }
 
@@ -912,8 +912,14 @@ impl Widget for A2uiSurface {
                 match ke.key_code {
                     KeyCode::Backspace => {
                         if self.cursor_pos > 0 {
-                            self.cursor_pos -= 1;
-                            self.text_input_buffer.remove(self.cursor_pos);
+                            // Find the previous char boundary
+                            let prev = self.text_input_buffer[..self.cursor_pos]
+                                .char_indices()
+                                .next_back()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            self.text_input_buffer.remove(prev);
+                            self.cursor_pos = prev;
                             needs_redraw = true;
 
                             // Emit data model change
@@ -933,7 +939,9 @@ impl Widget for A2uiSurface {
                         }
                     }
                     KeyCode::Delete => {
-                        if self.cursor_pos < self.text_input_buffer.len() {
+                        if self.cursor_pos < self.text_input_buffer.len()
+                            && self.text_input_buffer.is_char_boundary(self.cursor_pos)
+                        {
                             self.text_input_buffer.remove(self.cursor_pos);
                             needs_redraw = true;
 
@@ -954,13 +962,23 @@ impl Widget for A2uiSurface {
                     }
                     KeyCode::ArrowLeft => {
                         if self.cursor_pos > 0 {
-                            self.cursor_pos -= 1;
+                            // Move to previous char boundary
+                            self.cursor_pos = self.text_input_buffer[..self.cursor_pos]
+                                .char_indices()
+                                .next_back()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
                             needs_redraw = true;
                         }
                     }
                     KeyCode::ArrowRight => {
                         if self.cursor_pos < self.text_input_buffer.len() {
-                            self.cursor_pos += 1;
+                            // Move to next char boundary
+                            self.cursor_pos = self.text_input_buffer[self.cursor_pos..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(i, _)| self.cursor_pos + i)
+                                .unwrap_or(self.text_input_buffer.len());
                             needs_redraw = true;
                         }
                     }
@@ -1534,14 +1552,14 @@ impl A2uiSurface {
 
         // Determine font size based on usage hint
         let font_size = match text.usage_hint {
-            Some(TextUsageHint::H1) => 28.0,
-            Some(TextUsageHint::H2) => 22.0,
-            Some(TextUsageHint::H3) => 18.0,
-            Some(TextUsageHint::H4) => 16.0,
-            Some(TextUsageHint::H5) => 14.0,
-            Some(TextUsageHint::Caption) => 12.0,
-            Some(TextUsageHint::Code) => 13.0,
-            _ => 14.0, // Body default
+            Some(TextUsageHint::H1) => 20.0,
+            Some(TextUsageHint::H2) => 16.0,
+            Some(TextUsageHint::H3) => 14.0,
+            Some(TextUsageHint::H4) => 12.0,
+            Some(TextUsageHint::H5) => 11.0,
+            Some(TextUsageHint::Caption) => 9.5,
+            Some(TextUsageHint::Code) => 10.0,
+            _ => 11.0, // Body default
         };
 
         // Use different DrawText based on context for correct z-ordering:

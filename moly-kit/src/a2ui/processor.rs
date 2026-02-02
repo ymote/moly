@@ -212,21 +212,422 @@ impl A2uiMessageProcessor {
         events
     }
 
-    /// Parse and process a JSON string containing A2UI messages
+    /// Parse and process a JSON string containing A2UI messages.
+    ///
+    /// Tries strict array parse first. On failure, falls back to
+    /// parsing each element individually (skipping malformed ones)
+    /// so that valid messages like `beginRendering` and `surfaceUpdate`
+    /// still render even if `dataModelUpdate` has schema issues.
     pub fn process_json(&mut self, json: &str) -> Result<Vec<ProcessorEvent>, serde_json::Error> {
-        // Try to parse as array first
+        // Try parsing, repair truncated JSON if needed
+        let json = &Self::repair_json(json);
+
+        // Try strict array parse first
         match serde_json::from_str::<Vec<A2uiMessage>>(json) {
-            Ok(messages) => {
-                return Ok(self.process_messages(messages));
-            }
+            Ok(messages) => return Ok(self.process_messages(messages)),
             Err(e) => {
-                makepad_widgets::log!("Array parse error: {} (will try single message)", e);
+                eprintln!("[A2UI processor] Strict array parse failed: {}", e);
             }
         }
 
-        // Try to parse as single message
+        // Fallback: parse as array of generic Values, then try each individually
+        if let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(json) {
+            let mut events = Vec::new();
+            for (i, val) in values.iter().enumerate() {
+                match serde_json::from_value::<A2uiMessage>(val.clone()) {
+                    Ok(msg) => events.extend(self.process_message(msg)),
+                    Err(e) => {
+                        eprintln!(
+                            "[A2UI processor] Skipping message[{}]: {}",
+                            i, e
+                        );
+                    }
+                }
+            }
+            if !events.is_empty() {
+                return Ok(events);
+            }
+        }
+
+        // Last resort: try as single message
         let message: A2uiMessage = serde_json::from_str(json)?;
         Ok(self.process_message(message))
+    }
+
+    /// Attempt to repair malformed JSON from LLM output.
+    ///
+    /// Handles common LLM JSON issues:
+    /// - JavaScript-style comments (`//` and `/* */`)
+    /// - Trailing commas before `]` or `}`
+    /// - Unclosed strings, brackets, and braces (token-limit truncation)
+    /// - Incomplete trailing entries (key without value)
+    /// - Truncated arrays/objects (removes last incomplete element)
+    fn repair_json(json: &str) -> String {
+        // If it already parses, return as-is
+        if serde_json::from_str::<serde_json::Value>(json).is_ok() {
+            return json.to_string();
+        }
+
+        eprintln!("[A2UI repair] JSON is invalid, attempting repair");
+
+        // Step 1: Strip JS-style comments (// and /* */)
+        let mut repaired = Self::strip_json_comments(json);
+
+        // Step 2: Remove trailing commas before ] or }
+        repaired = Self::fix_trailing_commas(&repaired);
+
+        // Quick check after comment/comma fixes
+        if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+            eprintln!(
+                "[A2UI repair] Fixed by stripping comments/trailing commas"
+            );
+            return repaired;
+        }
+
+        // Step 2b: Fix lines with unbalanced braces
+        // GPT-4.1 often omits the outer closing brace on component lines,
+        // e.g. `{"id": "x", "component": {"Column": {"children": ...}}},`
+        //       should be `{"id": "x", "component": {"Column": {"children": ...}}}},`
+        repaired = Self::fix_unbalanced_lines(&repaired);
+
+        if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+            eprintln!(
+                "[A2UI repair] Fixed by balancing braces on lines"
+            );
+            return repaired;
+        }
+
+        // Step 3: Fix truncation — close unclosed brackets/braces/strings
+        repaired = repaired.trim_end().to_string();
+
+        // Remove trailing comma
+        while repaired.ends_with(',') {
+            repaired.pop();
+        }
+
+        let mut stack: Vec<char> = Vec::new();
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for ch in repaired.chars() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if ch == '\\' && in_string {
+                escape_next = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if in_string {
+                continue;
+            }
+            match ch {
+                '[' => stack.push(']'),
+                '{' => stack.push('}'),
+                ']' | '}' => { stack.pop(); }
+                _ => {}
+            }
+        }
+
+        if in_string {
+            repaired.push('"');
+        }
+
+        let trimmed = repaired.trim_end();
+        if trimmed.ends_with(':') || trimmed.ends_with(',') {
+            repaired = trimmed
+                .trim_end_matches(|c: char| c == ':' || c == ',')
+                .to_string();
+        }
+
+        while let Some(closer) = stack.pop() {
+            repaired.push(closer);
+        }
+
+        if serde_json::from_str::<serde_json::Value>(&repaired).is_ok() {
+            eprintln!(
+                "[A2UI repair] Fixed by closing brackets ({} -> {} bytes)",
+                json.len(),
+                repaired.len()
+            );
+            return repaired;
+        }
+
+        // Step 4: Try removing the last incomplete array element
+        // Find the last complete element by searching backwards for "},\n"
+        if let Some(fixed) = Self::truncate_to_last_complete_element(
+            &repaired,
+        ) {
+            if serde_json::from_str::<serde_json::Value>(&fixed).is_ok() {
+                eprintln!(
+                    "[A2UI repair] Fixed by truncating ({} -> {} bytes)",
+                    json.len(),
+                    fixed.len()
+                );
+                return fixed;
+            }
+        }
+
+        eprintln!("[A2UI repair] Repair failed, returning original");
+        json.to_string()
+    }
+
+    /// Strip JavaScript-style comments from JSON text.
+    /// Handles `// line comment` and `/* block comment */`.
+    fn strip_json_comments(json: &str) -> String {
+        let mut result = String::with_capacity(json.len());
+        let chars: Vec<char> = json.chars().collect();
+        let len = chars.len();
+        let mut i = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        while i < len {
+            if escape_next {
+                escape_next = false;
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            if in_string {
+                if chars[i] == '\\' {
+                    escape_next = true;
+                } else if chars[i] == '"' {
+                    in_string = false;
+                }
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            if chars[i] == '"' {
+                in_string = true;
+                result.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            // Check for // line comment
+            if i + 1 < len && chars[i] == '/' && chars[i + 1] == '/' {
+                // Skip until end of line
+                while i < len && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // Check for /* block comment */
+            if i + 1 < len && chars[i] == '/' && chars[i + 1] == '*' {
+                i += 2;
+                while i + 1 < len
+                    && !(chars[i] == '*' && chars[i + 1] == '/')
+                {
+                    i += 1;
+                }
+                i += 2; // skip */
+                continue;
+            }
+            result.push(chars[i]);
+            i += 1;
+        }
+        result
+    }
+
+    /// Fix trailing commas before `]` or `}`.
+    fn fix_trailing_commas(json: &str) -> String {
+        let mut result = String::with_capacity(json.len());
+        let chars: Vec<char> = json.chars().collect();
+        let len = chars.len();
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for i in 0..len {
+            if escape_next {
+                escape_next = false;
+                result.push(chars[i]);
+                continue;
+            }
+            if in_string {
+                if chars[i] == '\\' {
+                    escape_next = true;
+                } else if chars[i] == '"' {
+                    in_string = false;
+                }
+                result.push(chars[i]);
+                continue;
+            }
+            if chars[i] == '"' {
+                in_string = true;
+                result.push(chars[i]);
+                continue;
+            }
+            // Skip comma if followed only by whitespace and then ] or }
+            if chars[i] == ',' {
+                let rest = &chars[i + 1..];
+                let next_non_ws = rest.iter().find(|c| !c.is_whitespace());
+                if matches!(next_non_ws, Some(']') | Some('}')) {
+                    continue; // skip this trailing comma
+                }
+            }
+            result.push(chars[i]);
+        }
+        result
+    }
+
+    /// Fix lines where braces are unbalanced.
+    ///
+    /// GPT-4.1 often generates component definition lines with missing or
+    /// extra closing braces. This handles both cases:
+    /// - Missing `}`: when a new `{"id":` line starts while previous has
+    ///   unclosed braces, insert missing `}` before it.
+    /// - Extra `}`: when a line has more `}` than `{`, remove the excess
+    ///   closing braces from the end.
+    fn fix_unbalanced_lines(json: &str) -> String {
+        let mut result = String::with_capacity(json.len() + 512);
+        let mut running_balance: i32 = 0;
+
+        for line in json.split('\n') {
+            let trimmed = line.trim();
+
+            // When a new component starts, check if previous was unclosed
+            if trimmed.starts_with("{\"id\"") && running_balance > 0 {
+                let result_trimmed = result.trim_end().to_string();
+                result.clear();
+                let stripped = result_trimmed.trim_end_matches(',');
+                let had_comma =
+                    result_trimmed.len() > stripped.len();
+                result.push_str(stripped);
+                for _ in 0..running_balance {
+                    result.push('}');
+                }
+                if had_comma {
+                    result.push(',');
+                }
+                result.push('\n');
+                running_balance = 0;
+            }
+
+            // Count braces/brackets on this line, respecting strings
+            let mut line_balance: i32 = 0;
+            let mut in_str = false;
+            let mut esc = false;
+            for ch in trimmed.chars() {
+                if esc { esc = false; continue; }
+                if ch == '\\' && in_str { esc = true; continue; }
+                if ch == '"' { in_str = !in_str; continue; }
+                if in_str { continue; }
+                match ch {
+                    '{' | '[' => line_balance += 1,
+                    '}' | ']' => line_balance -= 1,
+                    _ => {}
+                }
+            }
+
+            // Fix extra closing braces on component lines
+            // Remove `}` at positions where running balance goes negative
+            if line_balance < 0 && trimmed.contains("\"id\"") {
+                let excess = (-line_balance) as usize;
+                let mut fixed = String::with_capacity(trimmed.len());
+                let mut removed = 0usize;
+                let mut bal: i32 = 0;
+                let mut in_s = false;
+                let mut esc2 = false;
+                for ch in trimmed.chars() {
+                    if esc2 { esc2 = false; fixed.push(ch); continue; }
+                    if ch == '\\' && in_s {
+                        esc2 = true; fixed.push(ch); continue;
+                    }
+                    if ch == '"' { in_s = !in_s; fixed.push(ch); continue; }
+                    if in_s { fixed.push(ch); continue; }
+                    match ch {
+                        '{' | '[' => { bal += 1; fixed.push(ch); }
+                        '}' | ']' => {
+                            bal -= 1;
+                            if bal < 0 && removed < excess {
+                                // Skip this excess closer
+                                bal += 1;
+                                removed += 1;
+                            } else {
+                                fixed.push(ch);
+                            }
+                        }
+                        _ => { fixed.push(ch); }
+                    }
+                }
+                let indent = line.len() - line.trim_start().len();
+                result.push_str(&line[..indent]);
+                result.push_str(&fixed);
+                result.push('\n');
+                running_balance += line_balance + removed as i32;
+            } else {
+                running_balance += line_balance;
+                result.push_str(line);
+                result.push('\n');
+            }
+        }
+
+        // Remove trailing newline added by split
+        if result.ends_with('\n') && !json.ends_with('\n') {
+            result.pop();
+        }
+        result
+    }
+
+    /// Try to truncate JSON to the last complete top-level array element.
+    fn truncate_to_last_complete_element(json: &str) -> Option<String> {
+        // Find positions of "}, " or "},\n" at nesting depth 1
+        // (top-level array elements in A2UI are objects)
+        let chars: Vec<char> = json.chars().collect();
+        let len = chars.len();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+        let mut last_complete_end = None;
+
+        for i in 0..len {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if in_string {
+                if chars[i] == '\\' {
+                    escape_next = true;
+                } else if chars[i] == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            if chars[i] == '"' {
+                in_string = true;
+                continue;
+            }
+            match chars[i] {
+                '[' | '{' => depth += 1,
+                ']' | '}' => {
+                    depth -= 1;
+                    // depth==1 means we just closed a top-level array
+                    // element (the outer [ is depth 0 after open)
+                    if depth == 1 && chars[i] == '}' {
+                        last_complete_end = Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let end = last_complete_end?;
+        // Build: everything up to and including this }, then close ]
+        let mut fixed: String = chars[..=end].iter().collect();
+        // Remove trailing comma if any
+        let trimmed = fixed.trim_end();
+        if trimmed.ends_with(',') {
+            fixed = trimmed
+                .trim_end_matches(',')
+                .to_string();
+        }
+        fixed.push_str("\n]");
+        Some(fixed)
     }
 
     /// Take pending user actions (clears the queue)

@@ -20,8 +20,8 @@ mod standard_message_content;
 mod theme_moly_kit_light;
 
 pub use a2ui_client::{
-    A2uiClient, is_a2ui_tool_call, set_global_a2ui_enabled, is_global_a2ui_enabled,
-    set_pending_a2ui_tool_calls, take_pending_a2ui_tool_calls,
+    A2uiClient, set_global_a2ui_enabled, is_global_a2ui_enabled,
+    extract_a2ui_json, set_pending_a2ui_json, take_pending_a2ui_json,
 };
 
 // Note: Many of these widgets are not ready to be public, or they are not

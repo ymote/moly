@@ -2,11 +2,10 @@ use makepad_widgets::*;
 use std::cell::{Ref, RefMut};
 use std::sync::{Arc, Mutex};
 
-use crate::aitk::protocol::ToolCall;
 use crate::aitk::utils::tool::display_name_from_namespaced;
 use crate::prelude::*;
 use crate::utils::makepad::events::EventExt;
-use crate::widgets::a2ui_client::{is_a2ui_tool_call, set_pending_a2ui_tool_calls};
+use crate::widgets::a2ui_client::{extract_a2ui_json, set_pending_a2ui_json};
 use crate::widgets::stt_input::*;
 
 // Re-export type needed to configure STT.
@@ -16,8 +15,8 @@ pub use crate::widgets::stt_input::SttUtility;
 #[derive(Clone, Debug, DefaultNone)]
 pub enum ChatAction {
     None,
-    /// A2UI tool calls were received from the model
-    A2uiToolCalls(Vec<ToolCall>),
+    /// A2UI JSON was extracted from the model response
+    A2uiJson(String),
     /// A2UI toggle was changed
     A2uiToggled(bool),
 }
@@ -498,103 +497,85 @@ impl Chat {
             .is_streaming
     }
 
-    /// Check for A2UI tool calls in messages and emit an action if found
-    /// Also auto-approves A2UI tool calls so they don't need user permission
-    fn emit_a2ui_tool_calls(&self, cx: &mut Cx, scope: &mut Scope) {
-        use crate::aitk::protocol::ToolCallPermissionStatus;
+    /// Extract A2UI JSON from the last bot message and emit it as an action.
+    ///
+    /// After streaming ends, inspects the last bot message for ` ```a2ui ``` `
+    /// code fences. If found, strips the JSON block from the displayed text
+    /// and stores the JSON for the shell app to render.
+    fn extract_and_emit_a2ui(&self, cx: &mut Cx, scope: &mut Scope) {
+        eprintln!("[A2UI extract] extract_and_emit_a2ui called");
 
         let Some(controller) = &self.chat_controller else {
+            eprintln!("[A2UI extract] no chat controller");
             return;
         };
 
-        // First, find and collect A2UI tool calls from the same message
-        let (a2ui_tool_calls, message_index) = {
-            let lock = controller.lock().unwrap();
-            let messages = &lock.state().messages;
+        let mut lock = controller.lock().unwrap();
+        let messages = &lock.state().messages;
 
-            // Find the last bot message with A2UI tool calls
-            let result = messages
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, m)| {
-                    matches!(m.from, EntityId::Bot(_))
-                        && m.content
-                            .tool_calls
-                            .iter()
-                            .any(|tc| is_a2ui_tool_call(&tc.name))
-                })
-                .map(|(idx, m)| {
-                    let tool_calls: Vec<ToolCall> = m
-                        .content
-                        .tool_calls
-                        .iter()
-                        .filter(|tc| is_a2ui_tool_call(&tc.name))
-                        .cloned()
-                        .collect();
-                    (tool_calls, idx)
-                });
-
-            match result {
-                Some((tool_calls, idx)) => (tool_calls, Some(idx)),
-                None => (Vec::new(), None),
-            }
+        // Find the last bot message
+        let Some((idx, message)) = messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, m)| matches!(m.from, EntityId::Bot(_)))
+        else {
+            eprintln!("[A2UI extract] no bot message found");
+            return;
         };
 
-        if !a2ui_tool_calls.is_empty() {
-            // Auto-approve A2UI tool calls so they don't show the
-            // permission prompt
-            if let Some(idx) = message_index {
-                let mut lock = controller.lock().unwrap();
-                let mut message = lock.state().messages[idx].clone();
+        let preview_end = message.content.text
+            .char_indices()
+            .take_while(|(i, _)| *i < 100)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        eprintln!(
+            "[A2UI extract] last bot msg len={}, starts_with='{}'",
+            message.content.text.len(),
+            &message.content.text[..preview_end]
+        );
 
-                for tool_call in &mut message.content.tool_calls {
-                    if is_a2ui_tool_call(&tool_call.name) {
-                        tool_call.permission_status =
-                            ToolCallPermissionStatus::Approved;
-                    }
-                }
+        let (clean_text, json) = extract_a2ui_json(&message.content.text, true);
 
-                lock.dispatch_mutation(VecMutation::Update(idx, message));
+        let Some(json_str) = json else {
+            eprintln!("[A2UI extract] no a2ui JSON found in message");
+            return;
+        };
 
-                // Add synthetic tool results so the conversation history
-                // remains valid for subsequent API calls. The OpenAI API
-                // requires a tool result message for every tool_call.
-                let tool_results: Vec<ToolResult> = a2ui_tool_calls
-                    .iter()
-                    .map(|tc| ToolResult {
-                        tool_call_id: tc.id.clone(),
-                        content: format!(
-                            "UI component '{}' rendered successfully.",
-                            tc.name
-                        ),
-                        is_error: false,
-                    })
-                    .collect();
+        eprintln!(
+            "[A2UI extract] found JSON ({} bytes), clean_text len={}",
+            json_str.len(),
+            clean_text.len()
+        );
 
-                lock.dispatch_mutation(VecMutation::Push(Message {
-                    from: EntityId::Tool,
-                    content: MessageContent {
-                        text: String::new(),
-                        tool_results,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }));
-            }
+        // Update the message text to remove the A2UI JSON block.
+        // Use a placeholder if clean text is empty — LLM APIs reject
+        // empty assistant messages in conversation history.
+        eprintln!("[A2UI extract] about to dispatch_mutation(Update) idx={}", idx);
+        let mut updated = message.clone();
+        updated.content.text = if clean_text.is_empty() {
+            "*UI updated in canvas*".to_string()
+        } else {
+            clean_text
+        };
+        lock.dispatch_mutation(VecMutation::Update(idx, updated));
+        eprintln!("[A2UI extract] dispatch_mutation done, calling set_pending_a2ui_json");
 
-            // Store tool calls in global state for the shell app
-            set_pending_a2ui_tool_calls(a2ui_tool_calls.clone());
+        // Store JSON for the shell app to render
+        set_pending_a2ui_json(json_str.clone());
+        eprintln!("[A2UI extract] set_pending_a2ui_json done");
 
-            // Also emit as widget action (for local consumers)
-            cx.widget_action(
-                self.widget_uid(),
-                &scope.path,
-                ChatAction::A2uiToolCalls(a2ui_tool_calls),
-            );
+        drop(lock);
 
-            cx.redraw_all();
-        }
+        // Emit as widget action for local consumers
+        cx.widget_action(
+            self.widget_uid(),
+            &scope.path,
+            ChatAction::A2uiJson(json_str),
+        );
+
+        cx.redraw_all();
     }
 
     pub fn set_chat_controller(
@@ -684,11 +665,11 @@ impl ChatRef {
         f(&mut *self.write())
     }
 
-    /// Check if A2UI tool calls were received and return them
-    pub fn a2ui_tool_calls(&self, actions: &Actions) -> Option<Vec<ToolCall>> {
+    /// Check if A2UI JSON was extracted and return it.
+    pub fn a2ui_json(&self, actions: &Actions) -> Option<String> {
         if let Some(item) = actions.find_widget_action(self.widget_uid()) {
-            if let ChatAction::A2uiToolCalls(tool_calls) = item.cast() {
-                return Some(tool_calls);
+            if let ChatAction::A2uiJson(json) = item.cast() {
+                return Some(json);
             }
         }
         None
@@ -723,8 +704,8 @@ impl ChatControllerPlugin for Plugin {
                 ChatStateMutation::SetIsStreaming(false) => {
                     self.ui.defer(|chat, cx, scope| {
                         chat.handle_streaming_end(cx);
-                        // Check for A2UI tool calls in the last message and emit action
-                        chat.emit_a2ui_tool_calls(cx, scope);
+                        // Extract A2UI JSON from the last message and emit action
+                        chat.extract_and_emit_a2ui(cx, scope);
                     });
                 }
                 ChatStateMutation::MutateBots(_) => {

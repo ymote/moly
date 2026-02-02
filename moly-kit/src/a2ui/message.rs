@@ -3,10 +3,16 @@
 //! This module defines the Rust types for all A2UI protocol messages.
 //! Messages are serialized/deserialized using serde_json.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use super::value::{BooleanValue, NumberValue, StringValue};
+
+/// Lenient f64 deserializer — accepts numbers, ignores other types.
+fn lenient_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    let val = Option::<serde_json::Value>::deserialize(d)?.and_then(|v| v.as_f64());
+    Ok(val)
+}
 
 /// Top-level A2UI message enum.
 ///
@@ -129,7 +135,7 @@ pub struct ComponentDefinition {
     pub id: String,
 
     /// Optional flex weight for Row/Column layouts
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_f64")]
     pub weight: Option<f64>,
 
     /// The component type and properties
@@ -259,6 +265,7 @@ pub struct CardComponent {
 #[serde(rename_all = "camelCase")]
 pub struct TextComponent {
     /// Text content (literal or path-bound)
+    #[serde(default)]
     pub text: StringValue,
 
     /// Usage hint for styling (h1, h2, h3, body, caption, etc.)
@@ -445,25 +452,31 @@ pub struct TabDefinition {
 // ============================================================================
 
 /// Alignment options
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Alignment {
+    #[default]
     Start,
     Center,
     End,
     Stretch,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Distribution options for Row/Column
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Distribution {
+    #[default]
     Start,
     Center,
     End,
     SpaceBetween,
     SpaceAround,
     SpaceEvenly,
+    #[serde(other)]
+    Unknown,
 }
 
 /// List scroll direction
@@ -473,10 +486,12 @@ pub enum ListDirection {
     #[default]
     Vertical,
     Horizontal,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Text usage hints for styling
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TextUsageHint {
     H1,
@@ -484,9 +499,12 @@ pub enum TextUsageHint {
     H3,
     H4,
     H5,
+    #[default]
     Body,
     Caption,
     Code,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Image fit modes
@@ -499,18 +517,23 @@ pub enum ImageFit {
     Fill,
     None,
     ScaleDown,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Image usage hints for sizing
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ImageUsageHint {
     Icon,
     Avatar,
     SmallFeature,
+    #[default]
     MediumFeature,
     LargeFeature,
     Header,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Orientation for dividers etc.
@@ -520,6 +543,8 @@ pub enum Orientation {
     #[default]
     Horizontal,
     Vertical,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Text input types
@@ -533,6 +558,8 @@ pub enum TextInputType {
     Number,
     Tel,
     Url,
+    #[serde(other)]
+    Unknown,
 }
 
 // ============================================================================
@@ -551,14 +578,20 @@ pub struct ActionDefinition {
     pub context: Vec<ActionContextItem>,
 }
 
-/// A single context item for an action
+/// A single context item for an action.
+///
+/// LLMs sometimes generate malformed context items (e.g. `{"path": "/x"}`
+/// instead of `{"key": "x", "value": {"path": "/x"}}`). Fields are
+/// defaulted to make deserialization lenient.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionContextItem {
     /// Key name
+    #[serde(default)]
     pub key: String,
 
     /// Value (literal or path-bound)
+    #[serde(default)]
     pub value: ActionValue,
 }
 
@@ -569,6 +602,14 @@ pub enum ActionValue {
     String(StringValue),
     Number(NumberValue),
     Boolean(BooleanValue),
+}
+
+impl Default for ActionValue {
+    fn default() -> Self {
+        Self::String(StringValue::Literal {
+            literal_string: String::new(),
+        })
+    }
 }
 
 /// Update the data model.

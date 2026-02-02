@@ -1,22 +1,25 @@
-//! A2UI-aware BotClient wrapper
+//! A2UI-aware BotClient wrapper.
 //!
-//! When A2UI is enabled, this client bypasses the wrapped client's streaming
-//! and makes direct non-streaming HTTP calls to avoid SSE parsing issues.
+//! When A2UI is enabled, this client prepends an A2UI system prompt
+//! describing the A2UI adjacency-list protocol so the LLM generates
+//! UI JSON as structured output in its response text.
 
 use crate::aitk::protocol::{
-    Bot, BotId, ClientResult, EntityId, MessageContent, Tool, ToolCall,
+    Bot, BotId, ClientResult, EntityId, Message, MessageContent, Tool,
 };
-use crate::aitk::protocol::{BotClient, Message};
+use crate::aitk::protocol::BotClient;
 use crate::aitk::utils::asynchronous::{BoxPlatformSendFuture, BoxPlatformSendStream};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// Global A2UI enabled flag - can be set from PromptInput and read by A2uiClient.
+// ============================================================================
+// Global A2UI state
+// ============================================================================
+
+/// Global A2UI enabled flag — set from PromptInput, read by A2uiClient.
 static GLOBAL_A2UI_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Set the global A2UI enabled state (call from PromptInput toggle).
+/// Set the global A2UI enabled state.
 pub fn set_global_a2ui_enabled(enabled: bool) {
     ::log::info!("[A2UI] Global enabled set to: {}", enabled);
     GLOBAL_A2UI_ENABLED.store(enabled, Ordering::SeqCst);
@@ -27,292 +30,215 @@ pub fn is_global_a2ui_enabled() -> bool {
     GLOBAL_A2UI_ENABLED.load(Ordering::SeqCst)
 }
 
-use std::sync::Mutex;
+/// Pending A2UI JSON — written by Chat widget, read by shell App.
+static PENDING_A2UI_JSON: Mutex<Option<String>> = Mutex::new(None);
 
-/// Global pending A2UI tool calls - written by Chat widget, read by App.
-static GLOBAL_A2UI_TOOL_CALLS: Mutex<Vec<ToolCall>> = Mutex::new(Vec::new());
-
-/// Store pending A2UI tool calls (called from Chat's emit_a2ui_tool_calls).
-pub fn set_pending_a2ui_tool_calls(tool_calls: Vec<ToolCall>) {
+/// Store pending A2UI JSON for the shell app to render.
+pub fn set_pending_a2ui_json(json: String) {
     ::log::info!(
-        "[A2UI] Storing {} pending tool calls",
-        tool_calls.len()
+        "[A2UI] Storing pending JSON ({} bytes)",
+        json.len()
     );
-    *GLOBAL_A2UI_TOOL_CALLS.lock().unwrap() = tool_calls;
+    *PENDING_A2UI_JSON.lock().unwrap() = Some(json);
 }
 
-/// Take pending A2UI tool calls (called by App, clears the buffer).
-pub fn take_pending_a2ui_tool_calls() -> Vec<ToolCall> {
-    let mut lock = GLOBAL_A2UI_TOOL_CALLS.lock().unwrap();
-    std::mem::take(&mut *lock)
-}
-
-// ============================================================================
-// Non-streaming response types (OpenAI chat completions format)
-// ============================================================================
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<CompletionChoice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompletionChoice {
-    message: CompletionMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompletionMessage {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ResponseToolCall>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseToolCall {
-    id: String,
-    function: ResponseFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseFunction {
-    name: String,
-    arguments: String,
+/// Take pending A2UI JSON (clears the buffer).
+pub fn take_pending_a2ui_json() -> Option<String> {
+    PENDING_A2UI_JSON.lock().unwrap().take()
 }
 
 // ============================================================================
-// Outgoing request types (for building the non-streaming request)
+// A2UI JSON extraction
 // ============================================================================
 
-#[derive(Serialize)]
-struct OutgoingMessage {
-    role: &'static str,
-    content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<serde_json::Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-}
+/// Extract A2UI JSON from ` ```a2ui ``` ` code fences in the text.
+///
+/// Returns `(clean_text, Option<a2ui_json>)` where `clean_text` has
+/// the code fence block removed, and `a2ui_json` is the extracted JSON
+/// string (if any).
+///
+/// During streaming, call with `force = false` — if no closing fence is
+/// found, the JSON is not extracted (still incomplete).
+/// After streaming ends, call with `force = true` — if no closing fence
+/// is found, treat everything after the opening fence as JSON (the LLM
+/// may have omitted the closing fence).
+pub fn extract_a2ui_json(text: &str, force: bool) -> (String, Option<String>) {
+    let fence_start = "```a2ui";
+    let fence_end = "```";
 
-#[derive(Serialize)]
-struct OutgoingTool {
-    #[serde(rename = "type")]
-    tool_type: &'static str,
-    function: OutgoingFunction,
-}
+    let Some(start_idx) = text.find(fence_start) else {
+        return (text.to_string(), None);
+    };
 
-#[derive(Serialize)]
-struct OutgoingFunction {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+    let json_start = start_idx + fence_start.len();
+
+    // Skip optional whitespace/newline after the opening fence
+    let json_start = text[json_start..]
+        .find(|c: char| !c.is_whitespace() || c == '[' || c == '{')
+        .map(|i| json_start + i)
+        .unwrap_or(json_start);
+
+    // Find the closing fence after the JSON content
+    let (json_end, block_end) =
+        if let Some(end_idx) = text[json_start..].find(fence_end) {
+            let json_end = json_start + end_idx;
+            (json_end, json_end + fence_end.len())
+        } else if force {
+            // No closing fence but streaming is done — use rest of text
+            (text.len(), text.len())
+        } else {
+            // No closing fence yet (likely still streaming).
+            // Hide everything from the opening fence onward.
+            let clean = text[..start_idx].trim().to_string();
+            return (clean, None);
+        };
+
+    let json_str = text[json_start..json_end].trim().to_string();
+    if json_str.is_empty() {
+        return (text.to_string(), None);
+    }
+
+    // Build cleaned text: everything before the block + everything after
+    let mut clean = text[..start_idx].to_string();
+    clean.push_str(&text[block_end..]);
+    let clean = clean.trim().to_string();
+
+    (clean, Some(json_str))
 }
 
 // ============================================================================
-// A2UI tool definitions
+// A2UI system prompt
 // ============================================================================
 
-/// A2UI tool definitions in aitk Tool format.
-fn get_a2ui_tools() -> Vec<Tool> {
-    vec![
-        Tool {
-            name: "create_text".to_string(),
-            description: Some(
-                "Create a text/label component to display static or dynamic text"
-                    .to_string(),
-            ),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Unique component ID"},
-                        "text": {"type": "string", "description": "Static text"},
-                        "dataPath": {"type": "string", "description": "JSON pointer"},
-                        "style": {"type": "string", "enum": ["h1","h3","caption","body"]}
-                    },
-                    "required": ["id"]
-                }"#).expect("invalid create_text schema"),
-            ),
-        },
-        Tool {
-            name: "create_button".to_string(),
-            description: Some(
-                "Create a clickable button that triggers an action".to_string(),
-            ),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "label": {"type": "string"},
-                        "action": {"type": "string"},
-                        "primary": {"type": "boolean"}
-                    },
-                    "required": ["id", "label", "action"]
-                }"#).expect("invalid create_button schema"),
-            ),
-        },
-        Tool {
-            name: "create_textfield".to_string(),
-            description: Some("Create a text input field".to_string()),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "dataPath": {"type": "string"},
-                        "placeholder": {"type": "string"}
-                    },
-                    "required": ["id", "dataPath"]
-                }"#).expect("invalid create_textfield schema"),
-            ),
-        },
-        Tool {
-            name: "create_checkbox".to_string(),
-            description: Some("Create a checkbox toggle".to_string()),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "label": {"type": "string"},
-                        "dataPath": {"type": "string"}
-                    },
-                    "required": ["id", "label", "dataPath"]
-                }"#).expect("invalid create_checkbox schema"),
-            ),
-        },
-        Tool {
-            name: "create_slider".to_string(),
-            description: Some("Create a slider for numeric values".to_string()),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "dataPath": {"type": "string"},
-                        "min": {"type": "number"},
-                        "max": {"type": "number"},
-                        "step": {"type": "number"}
-                    },
-                    "required": ["id", "dataPath", "min", "max"]
-                }"#).expect("invalid create_slider schema"),
-            ),
-        },
-        Tool {
-            name: "create_card".to_string(),
-            description: Some("Create a card container".to_string()),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "childId": {"type": "string"}
-                    },
-                    "required": ["id", "childId"]
-                }"#).expect("invalid create_card schema"),
-            ),
-        },
-        Tool {
-            name: "create_column".to_string(),
-            description: Some("Create a vertical layout container".to_string()),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "children": {"type": "array", "items": {"type": "string"}}
-                    },
-                    "required": ["id", "children"]
-                }"#).expect("invalid create_column schema"),
-            ),
-        },
-        Tool {
-            name: "create_row".to_string(),
-            description: Some("Create a horizontal layout container".to_string()),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "children": {"type": "array", "items": {"type": "string"}}
-                    },
-                    "required": ["id", "children"]
-                }"#).expect("invalid create_row schema"),
-            ),
-        },
-        Tool {
-            name: "set_data".to_string(),
-            description: Some("Set initial data value in the data model".to_string()),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "stringValue": {"type": "string"},
-                        "numberValue": {"type": "number"},
-                        "booleanValue": {"type": "boolean"}
-                    },
-                    "required": ["path"]
-                }"#).expect("invalid set_data schema"),
-            ),
-        },
-        Tool {
-            name: "render_ui".to_string(),
-            description: Some(
-                "Finalize and render the UI. Call this LAST.".to_string(),
-            ),
-            input_schema: Arc::new(
-                serde_json::from_str(r#"{
-                    "type": "object",
-                    "properties": {
-                        "rootId": {"type": "string"},
-                        "title": {"type": "string"}
-                    },
-                    "required": ["rootId"]
-                }"#).expect("invalid render_ui schema"),
-            ),
-        },
-    ]
-}
+/// System prompt describing the full A2UI adjacency-list protocol.
+const A2UI_SYSTEM_PROMPT: &str = r#"You can generate interactive UIs using the A2UI protocol.
+When the user asks you to create or update a UI, output A2UI JSON wrapped in a code fence:
 
-/// A2UI system prompt to guide the LLM.
-const A2UI_SYSTEM_PROMPT: &str = r#"You are an A2UI generator assistant. \
-Create user interfaces by calling the provided tools.
+```a2ui
+[ ... ]
+```
 
-RULES:
-1. Create components using tools (create_text, create_button, create_slider, etc.)
-2. Use create_column for vertical layouts, create_row for horizontal layouts
-3. Use create_card to wrap sections in styled containers
-4. Set initial data values with set_data for any bound components
-5. ALWAYS call render_ui as the LAST step with the root component ID
-6. Use descriptive IDs like "title", "volume-slider", "submit-btn"
-7. For sliders/checkboxes, always set initial data with set_data
+You may include a brief explanation outside the fence.
 
-Example flow for "create a volume control":
-1. create_text(id="volume-label", text="Volume", style="body")
-2. create_slider(id="volume-slider", dataPath="/volume", min=0, max=100, step=1)
-3. create_column(id="root", children=["volume-label", "volume-slider"])
-4. set_data(path="/volume", numberValue=50)
-5. render_ui(rootId="root")
+IMPORTANT:
+- Output valid JSON only inside the code fence. Do NOT add comments (no // or /* */).
+- Only use the component types listed below. Do NOT invent new types (no Tabs, Divider, Icon, Avatar, etc.).
+- Do NOT use Image components unless you have a real, working https URL. Use Text with emoji or descriptive labels instead.
+
+# Design Guidelines
+
+When the user requests an app, expand their request into a polished, feature-rich UI:
+- Flesh out the concept: add logical sections, realistic sample data, and secondary features a real app would have.
+- Use **Card** components generously to visually group related content with elevation for depth and structure.
+- Organize sections vertically with **Column** as the root. Use header **Text** (h1/h2) to label major sections and **Text** (h4) for card titles.
+- Include realistic, varied sample data in the data model (real names, dates, dollar amounts, descriptions — not generic placeholders).
+- Use **Row** layouts with weight to create multi-column displays (e.g. label on left, value on right; or icon-emoji on left, content on right).
+- Use the full range of **usageHint** values (h1 for page titles, h2 for section headers, h4 for card titles, body for content, caption for secondary/muted text, code for data values).
+- Add interactive elements: TextField for search/input, CheckBox for toggles, Slider for adjustable values, Button for actions.
+- Use **List** with templates for data-driven repeating items (transactions, messages, contacts, etc.).
+- Use emoji characters in Text labels to add visual richness (e.g. "🏦 My Bank", "💰 Balance", "📊 Stats").
+- Aim for 30-50 components to create a substantive, app-like experience.
+
+# A2UI Protocol
+
+Output a JSON array with three messages:
+
+1. **beginRendering** — initialize the surface with a root component ID
+2. **surfaceUpdate** — define all components as a flat adjacency list
+3. **dataModelUpdate** — set initial data values
+
+# Component Types
+
+## Layout
+- **Column** — vertical layout
+  `{"Column": {"children": {"explicitList": ["id1","id2"]}, "alignment": "center", "distribution": "spaceBetween"}}`
+- **Row** — horizontal layout (same fields as Column)
+- **Card** — styled container with elevation
+  `{"Card": {"child": "content-id", "elevation": 2}}`
+- **List** — scrollable data-driven list
+  `{"List": {"children": {"template": {"componentId": "item-tpl", "dataBinding": "/items"}}, "direction": "vertical"}}`
+
+## Display
+- **Text** — text label
+  `{"Text": {"text": {"literalString": "Hello"}, "usageHint": "h1"}}`
+  usageHint options: h1, h2, h3, h4, h5, body, caption, code
+- **Image** — image display
+  `{"Image": {"url": {"literalString": "https://..."}, "fit": "cover", "usageHint": "mediumFeature"}}`
+
+## Interactive
+- **Button** — clickable button (child is a text component ID)
+  `{"Button": {"child": "btn-label", "primary": true, "action": {"name": "submit", "context": []}}}`
+- **TextField** — text input (binds to data model path)
+  `{"TextField": {"text": {"path": "/form/name"}, "label": {"literalString": "Name"}, "placeholder": {"literalString": "Enter name"}}}`
+- **CheckBox** — toggle (binds to data model path)
+  `{"CheckBox": {"value": {"path": "/settings/darkMode"}, "label": {"literalString": "Dark Mode"}}}`
+- **Slider** — numeric slider (binds to data model path)
+  `{"Slider": {"value": {"path": "/volume"}, "min": 0, "max": 100, "step": 1}}`
+
+# Value Types
+
+Static values:
+- `{"literalString": "text"}`, `{"literalNumber": 42}`, `{"literalBoolean": true}`
+
+Data-bound values (two-way binding for interactive controls):
+- `{"path": "/data/key"}`
+
+# Data Model Values
+
+In `dataModelUpdate.contents`, each entry has a `key` and one value field:
+- `{"key": "name", "valueString": "Alice"}`
+- `{"key": "count", "valueNumber": 0}`
+- `{"key": "enabled", "valueBoolean": true}`
+- `{"key": "items", "valueArray": [...]}`
+- `{"key": "user", "valueMap": [{"key": "name", "valueString": "..."}]}`
+
+# Children
+
+- **explicitList**: fixed children: `{"explicitList": ["child1", "child2"]}`
+- **template**: data-driven list: `{"template": {"componentId": "tpl-id", "dataBinding": "/items"}}`
+
+# Component Definition
+
+Each component in `surfaceUpdate.components`:
+```json
+{"id": "unique-id", "component": {"Text": {...}}, "weight": 1.0}
+```
+`weight` is optional (used for flex sizing in Row/Column).
+
+# Complete Example
+
+User: "Create a counter app"
+
+```a2ui
+[
+  {"beginRendering": {"surfaceId": "main", "root": "root"}},
+  {"surfaceUpdate": {"surfaceId": "main", "components": [
+    {"id": "root", "component": {"Column": {"children": {"explicitList": ["title", "count-display", "buttons"]}, "alignment": "center"}}},
+    {"id": "title", "component": {"Text": {"text": {"literalString": "Counter"}, "usageHint": "h1"}}},
+    {"id": "count-display", "component": {"Text": {"text": {"path": "/count"}, "usageHint": "h2"}}},
+    {"id": "buttons", "component": {"Row": {"children": {"explicitList": ["dec-btn", "inc-btn"]}, "distribution": "spaceEvenly"}}},
+    {"id": "dec-label", "component": {"Text": {"text": {"literalString": "-"}}}},
+    {"id": "dec-btn", "component": {"Button": {"child": "dec-label", "action": {"name": "decrement", "context": []}}}},
+    {"id": "inc-label", "component": {"Text": {"text": {"literalString": "+"}}}},
+    {"id": "inc-btn", "component": {"Button": {"child": "inc-label", "primary": true, "action": {"name": "increment", "context": []}}}}
+  ]}},
+  {"dataModelUpdate": {"surfaceId": "main", "path": "/", "contents": [
+    {"key": "count", "valueNumber": 0}
+  ]}}
+]
+```
 "#;
 
 // ============================================================================
 // A2uiClient
 // ============================================================================
 
-/// A wrapper around a BotClient that injects A2UI tools when enabled.
-///
-/// When A2UI is enabled, it makes direct non-streaming HTTP calls to bypass
-/// aitk's SSE parser which cannot handle chunked tool call responses.
+/// A wrapper around a [`BotClient`] that injects the A2UI system prompt
+/// when A2UI mode is enabled, so the LLM generates A2UI JSON as
+/// structured output in its response text.
 pub struct A2uiClient {
     client: Box<dyn BotClient>,
     a2ui_enabled: Arc<AtomicBool>,
-    /// API base URL (e.g. "https://api.moonshot.ai/v1")
-    api_url: String,
-    /// API key for authentication.
-    api_key: String,
 }
 
 impl Clone for A2uiClient {
@@ -320,31 +246,20 @@ impl Clone for A2uiClient {
         Self {
             client: self.client.clone_box(),
             a2ui_enabled: self.a2ui_enabled.clone(),
-            api_url: self.api_url.clone(),
-            api_key: self.api_key.clone(),
         }
     }
 }
 
 impl A2uiClient {
     /// Create a new A2UI-aware client wrapper.
-    ///
-    /// `api_url` and `api_key` are used for direct non-streaming calls
-    /// when A2UI is enabled.
-    pub fn new(
-        client: Box<dyn BotClient>,
-        api_url: String,
-        api_key: String,
-    ) -> Self {
+    pub fn new(client: Box<dyn BotClient>) -> Self {
         Self {
             client,
             a2ui_enabled: Arc::new(AtomicBool::new(false)),
-            api_url,
-            api_key,
         }
     }
 
-    /// Enable or disable A2UI tool injection.
+    /// Enable or disable A2UI mode.
     pub fn set_a2ui_enabled(&self, enabled: bool) {
         self.a2ui_enabled.store(enabled, Ordering::SeqCst);
     }
@@ -353,177 +268,6 @@ impl A2uiClient {
     pub fn is_a2ui_enabled(&self) -> bool {
         self.a2ui_enabled.load(Ordering::SeqCst)
     }
-}
-
-/// Convert aitk Message to one or more OpenAI outgoing messages.
-///
-/// Tool result messages with multiple results are expanded into one
-/// outgoing message per result, since the OpenAI API requires each
-/// tool result to have its own message with a unique `tool_call_id`.
-fn to_outgoing_messages(msg: &Message) -> Vec<OutgoingMessage> {
-    let role = match &msg.from {
-        EntityId::User => "user",
-        EntityId::System => "system",
-        EntityId::Bot(_) => "assistant",
-        EntityId::Tool => "tool",
-        EntityId::App => "user",
-    };
-
-    // Tool result messages: expand one message per result
-    if !msg.content.tool_results.is_empty() {
-        return msg
-            .content
-            .tool_results
-            .iter()
-            .map(|r| OutgoingMessage {
-                role: "tool",
-                content: r.content.clone(),
-                tool_calls: None,
-                tool_call_id: Some(r.tool_call_id.clone()),
-            })
-            .collect();
-    }
-
-    let tool_calls = if !msg.content.tool_calls.is_empty() {
-        Some(
-            msg.content
-                .tool_calls
-                .iter()
-                .map(|tc| {
-                    json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": serde_json::to_string(&tc.arguments)
-                                .unwrap_or_default()
-                        }
-                    })
-                })
-                .collect(),
-        )
-    } else {
-        None
-    };
-
-    vec![OutgoingMessage {
-        role,
-        content: msg.content.text.clone(),
-        tool_calls,
-        tool_call_id: None,
-    }]
-}
-
-/// Convert aitk Tool to OpenAI function tool format.
-fn to_outgoing_tool(tool: &Tool) -> OutgoingTool {
-    let parameters =
-        serde_json::Value::Object((*tool.input_schema).clone());
-    OutgoingTool {
-        tool_type: "function",
-        function: OutgoingFunction {
-            name: tool.name.clone(),
-            description: tool
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .to_string(),
-            parameters,
-        },
-    }
-}
-
-/// Make a direct non-streaming HTTP call to the OpenAI-compatible API.
-async fn send_non_streaming(
-    api_url: String,
-    api_key: String,
-    model: String,
-    messages: Vec<OutgoingMessage>,
-    tools: Vec<OutgoingTool>,
-) -> Result<MessageContent, String> {
-    let url = format!(
-        "{}/chat/completions",
-        api_url.trim_end_matches('/')
-    );
-
-    let mut body = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-    });
-
-    if !tools.is_empty() {
-        body["tools"] = serde_json::to_value(&tools)
-            .map_err(|e| format!("Failed to serialize tools: {e}"))?;
-    }
-
-    ::log::info!(
-        "[A2UI] Non-streaming POST to {} with model {}",
-        url,
-        model
-    );
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<no body>".to_string());
-        return Err(format!(
-            "API returned status {}: {}",
-            status, body
-        ));
-    }
-
-    let text = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?;
-
-    ::log::info!("[A2UI] Response length: {} bytes", text.len());
-
-    let completion: ChatCompletionResponse =
-        serde_json::from_str(&text).map_err(|e| {
-            format!("Failed to parse response JSON: {e}")
-        })?;
-
-    let mut content = MessageContent::default();
-
-    if let Some(choice) = completion.choices.first() {
-        if let Some(ref text) = choice.message.content {
-            content.text = text.clone();
-        }
-
-        for tc in &choice.message.tool_calls {
-            let arguments: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or_default();
-
-            content.tool_calls.push(ToolCall {
-                id: tc.id.clone(),
-                name: tc.function.name.clone(),
-                arguments,
-                ..Default::default()
-            });
-        }
-    }
-
-    ::log::info!(
-        "[A2UI] Parsed {} tool calls, text len: {}",
-        content.tool_calls.len(),
-        content.text.len()
-    );
-
-    Ok(content)
 }
 
 impl BotClient for A2uiClient {
@@ -549,20 +293,16 @@ impl BotClient for A2uiClient {
         let a2ui_enabled = instance_enabled || global_enabled;
 
         if !a2ui_enabled {
-            // A2UI not enabled: forward to wrapped client as-is
+            eprintln!("[A2UI send] disabled (instance={}, global={})", instance_enabled, global_enabled);
             return self.client.send(bot_id, messages, tools);
         }
 
-        ::log::info!(
-            "[A2UI] Enabled - making non-streaming call ({} messages)",
+        eprintln!(
+            "[A2UI send] Enabled — prepending system prompt ({} messages)",
             messages.len()
         );
 
-        // Build combined tools
-        let mut all_tools: Vec<Tool> = tools.to_vec();
-        all_tools.extend(get_a2ui_tools());
-
-        // Build messages with A2UI system prompt
+        // Prepend A2UI system prompt, then forward to wrapped client
         let mut all_messages = vec![Message {
             from: EntityId::System,
             content: MessageContent {
@@ -573,58 +313,6 @@ impl BotClient for A2uiClient {
         }];
         all_messages.extend(messages.to_vec());
 
-        // Convert to outgoing format (tool results expand to
-        // multiple messages, one per tool_call_id)
-        let outgoing_messages: Vec<OutgoingMessage> = all_messages
-            .iter()
-            .flat_map(to_outgoing_messages)
-            .collect();
-        let outgoing_tools: Vec<OutgoingTool> =
-            all_tools.iter().map(to_outgoing_tool).collect();
-
-        let model = bot_id.id().to_string();
-        let api_url = self.api_url.clone();
-        let api_key = self.api_key.clone();
-
-        // Make the non-streaming call.
-        Box::pin(async_stream::stream! {
-            use crate::aitk::protocol::{ClientError, ClientErrorKind};
-
-            match send_non_streaming(
-                api_url,
-                api_key,
-                model,
-                outgoing_messages,
-                outgoing_tools,
-            ).await {
-                Ok(content) => {
-                    yield ClientResult::new_ok(content);
-                }
-                Err(err) => {
-                    ::log::error!("[A2UI] Non-streaming call failed: {}", err);
-                    yield ClientError::new(
-                        ClientErrorKind::Network,
-                        err,
-                    ).into();
-                }
-            }
-        })
+        self.client.send(bot_id, &all_messages, tools)
     }
-}
-
-/// Check if a tool call is an A2UI tool.
-pub fn is_a2ui_tool_call(name: &str) -> bool {
-    matches!(
-        name,
-        "create_text"
-            | "create_button"
-            | "create_textfield"
-            | "create_checkbox"
-            | "create_slider"
-            | "create_card"
-            | "create_column"
-            | "create_row"
-            | "set_data"
-            | "render_ui"
-    )
 }
